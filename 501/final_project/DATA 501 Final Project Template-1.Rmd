@@ -1,0 +1,473 @@
+---
+title: "Analyzing Kickstarter Data for Indicators of Successful Project Campaigns"
+subtitle: "DATA501 Foundations of Data Science Using R"
+author: "Christina Lawrence"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true    
+    toc_depth: 2
+---
+
+```{r setup, echo=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(car)
+library(GGally)
+library(lubridate)
+library(scales)
+
+df = read_csv("kickstarter.csv") 
+df_filtered = df %>% filter(STATE != "canceled" & STATE != "suspended")
+df_filtered = df_filtered %>% mutate(LAUNCHED_DATE = as.Date(LAUNCHED_DATE, format="%m/%d/%Y"))
+df_filtered = df_filtered %>% mutate(DEADLINE_DATE = as.Date(DEADLINE_DATE, format="%m/%d/%Y"))
+
+
+df_filtered = df_filtered %>% mutate(CATEGORY = as.factor(CATEGORY))
+df_filtered = df_filtered %>% mutate(STATE = as.factor(STATE))
+
+#Num days the campaign lasted from launch date to deadline
+df_filtered = df_filtered %>% mutate(days_of_campaign = interval(df_filtered$LAUNCHED_DATE, df_filtered$DEADLINE_DATE) %/% days(1))
+
+#Isolating the year and month of launch to use in graphics
+df_filtered = df_filtered %>% mutate(LAUNCHED_YEAR = year(df_filtered$LAUNCHED_DATE))
+df_filtered = df_filtered %>% mutate(LAUNCHED_MONTH = month(df_filtered$LAUNCHED_DATE))
+
+#Coercing currency strings into numeric types
+df_filtered = df_filtered %>% mutate(GOAL_IN_USD = parse_number(df_filtered$GOAL_IN_USD))
+df_filtered = df_filtered %>% mutate(PLEDGED_IN_USD = parse_number(df_filtered$PLEDGED_IN_USD))
+
+#Removing Goals that are 0 dollars
+df_filtered = df_filtered %>% filter(GOAL_IN_USD > 0)
+
+#Removing negative backer counts
+df_filtered = df_filtered %>% filter(BACKERS_COUNT >= 0)
+
+#Removing missing backer counts
+df_filtered = df_filtered %>% filter(!is.na(df_filtered$BACKERS_COUNT))
+
+#Removing phantom pledges from no backers
+df_filtered = df_filtered %>% filter(!(BACKERS_COUNT == 0 & PLEDGED_IN_USD > 0))
+
+#Removing phantom backers that do not pledge money
+df_filtered = df_filtered %>% filter(!(BACKERS_COUNT > 0 & PLEDGED_IN_USD == 0))
+
+#Num backers per day
+df_filtered = df_filtered %>% mutate(backers_per_day = BACKERS_COUNT/days_of_campaign)
+
+#Filtering out the cases where Pledged >= Goal, but state is 'failed' and
+#and where Pledged < Goal and state is 'successful'
+df_filtered = df_filtered %>% mutate(state_confirm = PLEDGED_IN_USD >= GOAL_IN_USD)
+df_filtered = df_filtered %>% filter(!(STATE == "successful" & state_confirm == FALSE))
+df_filtered = df_filtered %>% filter(!(STATE == "failed" & state_confirm == TRUE))
+
+#Percent of goal reached
+df_filtered = df_filtered %>% mutate(pledge_to_goal = round(PLEDGED_IN_USD/GOAL_IN_USD, digits=2))
+quantile(df_filtered$pledge_to_goal, c(0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, .9999))
+pledge_to_goal_outliers <- df_filtered[(df_filtered$pledge_to_goal > 124),]
+#Remove outliers that are above the 99.9 quartile
+df_filtered = df_filtered %>% filter(pledge_to_goal < 124)
+
+#Pledge amount per backer 
+df_filtered = df_filtered %>% mutate(pledge_per_backer = ifelse(BACKERS_COUNT == 0, 0, PLEDGED_IN_USD/BACKERS_COUNT))
+#Find where the most data is and use that.
+quantile(df_filtered$pledge_per_backer, c(0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, .9999))
+df_filtered = df_filtered %>% filter(pledge_per_backer <= 1550)
+
+
+#Avg amount pledged per day
+df_filtered = df_filtered %>% mutate(avg_pledged_per_day = round(PLEDGED_IN_USD/days_of_campaign, digits = 2))
+
+
+
+#Stratified RS
+df_stratified = df_filtered %>% group_by(CATEGORY) %>% sample_frac(.2)
+goal_quantile = round(quantile(df_stratified$GOAL_IN_USD, probs=seq(0, 1, 1/10)))
+backer_quantile = round(quantile(df_stratified$BACKERS_COUNT, probs=seq(0, 1, 1/10)))
+days_quantile = round(quantile(df_filtered$days_of_campaign, probs=seq(0, 1, 1/2)))
+df_stratified = df_stratified %>% mutate(goal_quantiles = as.numeric(cut(GOAL_IN_USD, breaks = goal_quantile, include.lowest = TRUE)))
+df_stratified = df_stratified %>% mutate(backers_quantiles = as.numeric(cut(BACKERS_COUNT, breaks = backer_quantile, include.lowest = TRUE)))
+df_stratified = df_stratified %>% mutate(days_quantiles = as.numeric(cut(days_of_campaign, breaks = days_quantile, include.lowest = TRUE)))
+
+```
+
+<center>
+
+![](https://willamette.edu/offices/marketing/images/for-download/everyday-user/compass/large/compass-full-color.jpg){width="67"}
+
+</center>
+
+## ABSTRACT
+
+Kickstarter is a crowdfunding website for creative endeavors.  People can present an idea in some area (art or technology, for example), set a funding goal, a deadline, and define some rewards.  Interested parties can pledge money to back these projects.  Around 41% of projects presented on Kickstarter succeed and there is a lot of interest around the factors that produce a successful campaign.  The following study analyzes the Kickstarter Codebook by Jonathan Leland via ICPSR to evaluate and present the factors that are associated with a successful campaign.
+
+## INTRODUCTION
+
+Kickstarter launched its service in April 28, 2009 and, to date, has helped over 250,000 projects get funded.  There is intense interest around what goes into a successful campaign. To be successful, setting a realistic goal, creating interesting rewards for those who pledge, and generating interest and awareness, at least through social media, but also locally, seem to be key.  Some categories have more success than others.  There is also some evidence that the month of the year that you launch the project or when you time your rewards can lead to success.  Not all of these things can be explored in the Kickstarter Codebook, so I looked at factors like the number of backers, the month of the launch, and the categories the projects fall in to see how they related to successful campaigns.
+
+Definition of success:
+
+Before I begin detailing the analysis, I must first define success and detail how the dataset limits this definition.  The Kickstarter data includes 4 states into which every project falls:  successful, canceled, failed, and suspended.  “Successful” and “Failed” categories allow the natural progression of a project campaign - meaning, they were not cut short early by the creator nor were they stopped by Kickstarter.  They have a progression timeline that begins at launch date and ends at the deadline.  For this reason, I chose to remove the “cancelled” and “suspended” states from my analysis and focus on the project campaigns that allowed all of the time to pass.
+
+
+## DATA AND METHODOLOGY
+
+The Kickstarter Codebook consists of data ranging from 2009-2020 and contains the following variables of potential interest:
+<br><br>
+CATEGORY - 15 categories into which Kickstarter projects can fall<br>
+SUBCATEGORY - 161 subcategories<br>
+PROJECT_PAGE_LOCATION_NAME - name of project location city<br>
+PROJECT_PAGE_LOCATION_STATE - name of project location state<br>
+PROJECT_PAGE_LOCATION_COUNTY - name of the project location county<br>
+LAUNCHED_DATE - date the project was launched<br>
+DEADLINE_DATE - date the project was scheduled to end<br>
+GOAL_IN_USD - goal set by creator in USD<br>
+PLEDGED_IN_USD - amount pledged by backers in USD<br>
+BACKERS_COUNT - number of people who pledged money for a project<br>
+STATE - one of: cancelled, suspended, failed, successful<br>
+<br>
+Based on these variables, I created the following variables of interest to further explore the data:<br>
+
+days_of_campaign - Time project was active (deadline - launch)<br>
+pledge_to_goal - pledge/goal rounded to 2 decimal places<br>
+pledge_per_backer - pledge/backer count<br>
+goal_quantiles - Split the goals into quantiles to compare to categories<br>
+backer_quantiles - Split the backer count into quantiles to compare to categories<br>
+days_quantiles - Split the days_of_campaign into quantiles to compare to categories<br>
+<br>
+Data issues:<br>
+<br>
+LAUNCHED_DATE and DEADLINE_DATE were both character strings and not date types.  These were set to date types.<br>
+Currency in USD were strings and not numeric.  These were parsed as numeric.<br>
+There were some GOAL_IN_USD set to 0.  These rows were removed because this is not a realistic goal.<br>
+There were some instances where there were no backers, but there were pledge amounts.  I removed these rows because this data does to make sense.<br>
+There were also some instances where there were no pledge amounts, but a backer existed.  I also removed these rows because this does not make sense.<br>
+There were some rows that were listed as successful, but the pledge amount did not meet the goal.  These were removed as a false positive.<br>
+There were some rows that that were listed as failed, but the pledge amount did meet the goal.  These were removed as a false negative.<br>
+There were 2 rows that had -2 backers.  These rows were removed because negative backers do not make sense.<br>
+<br>
+Controls to limit bias:<br>
+
+The data cleaning involved removing false positives and negatives of success defined above in the data issues.<br>
+<br>
+Outliers removed:<br> <br> 
+pledge_to_goal over the 99.9th quantile.<br>
+pledge_per_backer over the 99.9th quantile<br>
+<br>
+
+Study Design:<br>
+<br>
+The structure of this study is observational, with data pulled from the cleaned and filtered Kickstarter Codebook stratified by category.  I grouped by category and randomly sampled 20% from each category in order to have a representative set for the analysis.  The resulting analysis was then further filtered to only states that were “successful” in order to focus on factors that lead to successful campaigns.  With a Kickstarter Codebook cleaned data set of around 436810 rows, the resulting stratified sample contains 87363 rows.  Each observational unit is a project on Kickstarter.  Response variables are the pledge_to_goal and STATE variables.  In the analysis, the STATE variable is held to “successful” in order to explore how the variables relate to a successful project campaign.  The pledge_to_goal becomes an important proxy for the success of the project. 
+
+There are covariates that I did not fully explore in this dataset.  One of these being how the active time in the campaign relates to the success of the project.  Perhaps people who have a longer amount of time to reach their goal are more successful.  Another possible covariate is location.  I did not explore how people in the U.S. fare compared to other countries or other possible ways to slice up location data.
+
+This study was carried out in a series of steps that included:
+<br><br>
+Cleaning data and creating new variables that might possibly be useful<br>
+Visualizing the data in ways that might give clues to variable relationships<br>
+Creating hypothesis tests to back up graphical indications of significance<br>
+Creating a model that fits a possible definition of success in a Kickstarter project<br>
+
+## RESULTS
+
+EXPLORATORY ANALYSIS and HYPOTHESIS TESTING:
+
+The following figures show exploratory analysis of the Kickstarter data.  For the first 3 figures,
+I use the entire filtered, cleaned Kickstarter dataset to get an idea of the overall population.
+
+
+```{r echo=FALSE, message = FALSE, warnings = FALSE, warn.conflicts = FALSE, }
+
+#Category quantity of successful campaigns
+df_filtered %>%
+  ggplot(aes(CATEGORY, fill= STATE)) +
+  geom_bar(position='dodge') +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  labs(x = "Project Categories",
+       y = "Count of Successful Campaigns",
+       fill = "Campaign Status",
+       title = "Figure 1 - Quantity of Successful Campaigns by Category",
+       subtitle = "Music has the Greatest Quantity; Journalism, the Least",
+       caption = "Based on Kickstarter Dataset by Jonathan Leland via ICPSR") 
+```
+
+#Figure 1
+Figure 1 displays raw numbers of launches per category success and failure and highlights some categories are more popular than others.  This suggests there may be a connection between the category
+you choose for your project and the chance the project will succeed.  To test to see
+if there is a significant relationship between category the project state, the following chi-squared
+test for independence is set up.
+
+H0 category and success are independent
+HA category and success are dependent
+
+```{r}
+chisq_test_cat_state = chisq.test(df_filtered$CATEGORY,df_filtered$STATE)
+chisq_test_cat_state
+
+#Assumption tests can be found in the Appendix.
+```
+
+The p-value is very much below the threshold of .05, so we reject the null hypothesis and
+determine that category and success are significantly associated.
+
+```{r echo=FALSE}
+cat_date = df_filtered %>% group_by(LAUNCHED_MONTH) %>% summarize(count = n()) %>% arrange(desc(count))
+cat_date_highest = cat_date %>% arrange(desc(count)) %>% head(1)
+cat_date_lowest = cat_date %>% arrange(count) %>% head(1)
+ggplot() +
+  geom_line(data = cat_date, aes(x=LAUNCHED_MONTH, y=count))+
+  geom_point(data = cat_date, aes(x=LAUNCHED_MONTH, y=count, size = 3), color="black") +
+  geom_point(data = cat_date_highest, aes(x=LAUNCHED_MONTH, y=count, size = 3), color="orange3") +
+  geom_point(data = cat_date_lowest, aes(x=LAUNCHED_MONTH, y=count, size = 3), color="cyan4") +
+  geom_text(data=cat_date, x = 9, y = 41000, label = paste("Peak Launches = ", cat_date_highest$count)) +
+  geom_text(data=cat_date, x = 10, y = 25000, label = paste("Drop in Launches = ", cat_date_lowest$count)) +
+  scale_x_continuous("Month Campaign Launched", labels = cat_date$LAUNCHED_MONTH, breaks = cat_date$LAUNCHED_MONTH) +
+  theme(legend.position="none") +
+  labs(y = "Number of Campaigns Launched",
+       title = "Figure 2 - Monthly Trend in Campaigns Launched",
+       subtitle = "The Peak Hits in July and the Low",
+       caption = "Based on Kickstarter Dataset by Jonathan Leland via ICPSR")
+```
+#Figure 2
+Figure 2 shows the number of project campaigns started on a particular month, with the highest number started in July and the lowest number oin December.  This might indicate that the month you start a campaign plays a role in your chance of success.  To test this, I run an association test on the variables of the launch month and project state.
+<br><br>
+Test dependence of month launched on the state of the project
+H0 - launch month and state are independent
+HA - launch month and state are dependent
+
+```{r}
+chisq_test_month_state = chisq.test(df_stratified$LAUNCHED_MONTH,df_stratified$STATE)
+chisq_test_month_state
+
+#Assumption tests can be found in the Appendix.
+```
+The p-value is very much below the threshold of .05, so we reject the null hypothesis and
+determine that category and success are significantly associated.
+<br>
+---<br>
+<br>
+Similarly, testing the association to the project category would strenghten the indication that the launch month
+is associated with the success of the project.
+<br><br>
+Test dependence of month launched on the category of the project
+H0 - launch month and category are independent
+HA - launch month and category are dependent
+
+```{r}
+chisq_test_month_category = chisq.test(df_stratified$LAUNCHED_MONTH, df_stratified$CATEGORY)
+chisq_test_month_category
+
+#Assumption tests can be found in the Appendix.
+```
+
+The p-value is very much below the threshold of .05, so we reject the null hypothesis and
+determine that category and success are significantly associated.
+
+
+```{r  echo=FALSE, message = FALSE, warnings = FALSE}
+#Looking at backers
+#mutate case id 14429 and 117147 because backer_count doesn't make sense
+
+backers_cat_state = df_filtered %>% group_by(CATEGORY, STATE) %>% summarize(average = round(mean(BACKERS_COUNT, na.rm=TRUE)))
+backers_high = backers_cat_state %>% filter(STATE == "successful") %>% arrange(desc(average)) %>% head(1)
+backers_low = backers_cat_state %>% filter(STATE == "successful") %>% arrange(average) %>% head(1)
+
+backers_cat_state %>% 
+  ggplot() +
+  geom_col(data= backers_cat_state, aes(CATEGORY, average, fill=STATE), position="dodge") +
+   geom_text(data=cat_date, x = as.integer(backers_high$CATEGORY)+.5, y = backers_high$average, label = backers_high$average) +
+   geom_text(data=cat_date, x = as.integer(backers_low$CATEGORY)+.5, y = backers_low$average, label = backers_low$average) +
+  scale_y_continuous(labels = comma) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  labs(y = "Average Number of Backers",
+       x = "Project Categories",
+       fill = "Campaign Status",
+       title = "Figure 3 - Some Categories Enjoy More Backers Than Others",
+       subtitle = paste(backers_high$CATEGORY, "has", backers_high$average, "backers on average vs.", backers_low$average, "for", backers_low$CATEGORY),
+       caption = "Based on Kickstarter Dataset by Jonathan Leland via ICPSR")
+```
+Backers seem to be a very important part of a successful Kickstarter campaign.  The more backers, the more opportunity to for pledge dollars to reach a goal.  Figure 3 indicates that some project campaign categories have more backers, on average.  To test the significance of the average of the successful campaigns, I performed a Tukey Test to compare all of the pairs.  To satisfy the test for normality, I needed to transform the backers count with log10.
+
+```{r}
+#Testing significance in average backer count between categories
+tukeyTestData = df_filtered  %>% filter(STATE == "successful") %>% select(CATEGORY, BACKERS_COUNT)
+
+model = aov(log10(BACKERS_COUNT)~CATEGORY, data=tukeyTestData)
+summary(model)
+tukeyHSD = TukeyHSD(model, conf.level=.95)
+category_head = head(tukeyHSD$CATEGORY, 20)
+category_head
+
+#Assumption tests can be found in the Appendix.
+```
+The full table for the Tukey test output was too large to include in the report, but I include the ability to un-comment and print it in the Appendix.  The p-values prove there is a significance in larger variations in the successful average backers plot from Figure 3.
+<br>
+---<br>
+<br>
+Test dependence of backers on categories, I factored the backer data into quantiles to compare
+with a chi-squared test of independence.
+<br><br>
+H0 - launch month and category are independent
+HA - launch month and category are dependent
+
+```{r}
+chisq_test_backers_category = chisq.test(df_stratified$backers_quantiles, df_stratified$CATEGORY)
+chisq_test_backers_category
+```
+The resulting p-value indicates that backers and category have a significant association.
+
+
+```{r echo = FALSE}
+
+df_stratified %>% group_by(CATEGORY) %>% summarize(median = median(round(pledge_to_goal*100, digits = 2))) %>%
+ggplot( aes(x = CATEGORY,
+           y = `median`)) + 
+       geom_col() +
+       labs(title = "Figure - 4 Most and Least Successful Categories", 
+            subtitle = "Categories that get at least 100% vs categories that do not cross 10%",
+            x = "Project Categories", 
+            y = "Median Percent of Goal Pledged",
+            caption = "Based on Kickstarter Dataset by Jonathan Leland via ICPSR") + 
+      # scale_y_continuous(breaks = seq(0, 100, by = 10)) +
+       theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+       geom_hline(yintercept = 100, 
+                  linetype = "solid",
+                  color = "green4") +
+         geom_hline(yintercept = 10, 
+                  linetype = "solid", 
+                  color = "orange") +
+    theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+```
+<br>
+Figure 4 shows the categories that have the most and least successful project campaigns.  Art, Comics, Dance, Music, and Theater all have median percentage of goal pledged of at least 100%, making these categories the most successful.  Crafts, Food, Journalism, and Technology represent the least successful categories.  Using the pledged_to_goal variable, I create a model made up of some of the values that were analyzed earlier: LAUNCHED_MONTH, CATEGORY, and BACKERS_COUNT.
+
+
+```{r echo = FALSE, message = FALSE, warnings = FALSE}
+mlm_data = df_stratified %>% filter(STATE == "successful") %>% 
+    group_by(LAUNCHED_MONTH, CATEGORY) %>% 
+    summarize(median_pledge_to_goal = median(pledge_to_goal), 
+              median_backers_count = median(BACKERS_COUNT))
+
+ggplot(data=mlm_data, aes(y = median_pledge_to_goal*100, x = median_backers_count)) +
+  geom_point(aes(color=CATEGORY)) + 
+  geom_smooth(method='lm',fullrange=TRUE, se=FALSE) +
+  theme_classic() +
+  labs(y = "Median Pledge/Goal Percent",
+       x = "Median Number of Backers",
+       color = "Project Category",
+       title = "Figure 5 - How Linear is the Data?",
+       caption = "Based on Kickstarter Dataset by Jonathan Leland via ICPSR")
+```
+The data for median percentage vs number of backers shows a somewhat linear relationship.  To explore a model, I run a 
+multiple regression model that uses the median_backers_count and category as predictors for the response variable, median_pledge_to_goal.
+
+Assumption can be found in the appendix.
+
+
+```{r fig.show="hold", out.width="50%"}
+lm = lm(median_pledge_to_goal ~ median_backers_count + CATEGORY, data=mlm_data)
+summary(lm)
+#plot(lm)
+```
+
+The adjusted R-squared value for this model suggests that over 83% of the variance of the response variable median_pledge_to_goal can be explained by this model.  The diagnostic plots show there are 3 leverage points in this model, but the removing them would be impossible due to the way the covariate of the launched month is tied to this data through aggregation.
+
+## CONCLUSION
+
+Kickstarter project campaigns have the potential to fund creative projects that might not otherwise come to fruition.  But, this can only be achieved when the campaign is fully funded by the deadline.  Through this analysis, I have attempted to associate some of the most important factors to the success of a project.  Backers and timing of the launch date are important parts of achieving success.  An area for further study would be to see how setting an appropriate goal or how long the campaign lasts.
+
+
+## APPENDIX
+The following code sections test assumptions from the various hypothesis tests and linear regression model.
+
+```{r}
+#Expected counts of all cells ≥ 5
+#chisq_test_cat_state$expected
+
+#Each observation contributes to only 1 cell
+#This is necessarily the case because each project can only be in one category
+
+#Independent groups 
+#Kickstarter groups are independent of each other
+
+```
+
+
+```{r}
+#Expected counts of all cells ≥ 5
+#chisq_test_month_state$expected
+
+#Each observation contributes to only 1 cell
+#This is necessarily the case because each project can only be in one category
+
+#Independent groups 
+#Kickstarter groups are independent of each other
+```
+
+
+```{r}
+#Expected counts of all cells ≥ 5
+#chisq_test_month_category$expected
+
+#Each observation contributes to only 1 cell
+#This is necessarily the case because each project can only be in one category
+
+#Independent groups 
+#Kickstarter groups are independent of each other
+```
+
+```{r}
+
+#Print the TukeyHSD table generated in the report
+#tukeyHSD
+
+# Observations are independent (within and across groups)
+# Each row of data is a project independent of another and each category is independent
+# any other category
+
+# Each group’s observations are normally distributed
+#tukeyTestData %>% ggplot() +
+#geom_histogram(aes(log(BACKERS_COUNT))) +
+#facet_wrap(~CATEGORY)
+
+# Homogeneity of variance within groups
+# tukeyTestData %>% ggplot() +
+# geom_boxplot(aes(CATEGORY, BACKERS_COUNT))
+```
+
+```{r}
+#As these take up too much space for the report, runnable lines are commented out
+#Expected counts of all cells ≥ 5
+#chisq_test_backers_category$expected
+
+#Each observation contributes to only 1 cell
+#This is necessarily the case because each project can only be in one category
+
+#Independent groups 
+#Kickstarter groups are independent of each other
+```
+
+```{r}
+par(mfrow=c(2,2)) # plot the diagnostics in a 2x2 grid
+#plot(lm)
+par(mfrow=c(1,1))
+
+#vif(lm)
+
+#Uncomment the above plot and vif to see the diagnostics
+
+#Linearity
+#In the diagnostic plots, There is some strange clustering instead of randomly disbursed points in the Residuals vs Fitted plot.
+#Independent observations (given X)
+#The VIF shows a value just over 10, which is not good.  It would be good to explore other variables that have less correlation to the category.
+#Normally-distributed errors/residuals
+#The diagnostic plot shows some deviations from the QQ Residuals line
+#Equal variance for all X's
+#The scale-location plot shows the same kind of clustering in the Residuals vs Fitted plot.
+```
+
+
